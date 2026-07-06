@@ -255,6 +255,14 @@ type GrafanaConfig struct {
 	// It is used for on-behalf-of auth in Grafana Cloud.
 	IDToken string
 
+	// OAuth holds optional OAuth2 client-credentials configuration. When set and
+	// enabled, the server obtains a short-lived bearer token from the OAuth
+	// provider and uses it to authenticate to Grafana instead of a static
+	// service account token. It is populated from the GRAFANA_OAUTH_*
+	// environment variables. It is a pointer so the cached token source is
+	// shared across the copies of GrafanaConfig that flow through the context.
+	OAuth *OAuthConfig
+
 	// TLSConfig holds TLS configuration for all Grafana clients.
 	TLSConfig *TLSConfig
 
@@ -557,13 +565,15 @@ func NewExtraHeadersRoundTripper(rt http.RoundTripper, headers map[string]string
 }
 
 // AuthRoundTripper wraps an http.RoundTripper to add authentication headers.
-// It supports on-behalf-of (OBO) auth via access/ID tokens, API key bearer
-// auth, and HTTP basic auth, in that priority order.
+// It supports on-behalf-of (OBO) auth via access/ID tokens, OAuth2
+// client-credentials bearer auth, API key bearer auth, and HTTP basic auth, in
+// that priority order.
 type AuthRoundTripper struct {
 	accessToken string
 	idToken     string
 	apiKey      string
 	basicAuth   *url.Userinfo
+	oauth       *OAuthConfig
 	underlying  http.RoundTripper
 }
 
@@ -571,6 +581,7 @@ func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	clonedReq := req.Clone(req.Context())
 
 	accessToken, idToken, apiKey, basicAuth := rt.accessToken, rt.idToken, rt.apiKey, rt.basicAuth
+	oauth := rt.oauth
 	cfg := GrafanaConfigFromContext(req.Context())
 	if cfg.AccessToken != "" {
 		accessToken = cfg.AccessToken
@@ -584,13 +595,26 @@ func (rt *AuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	if cfg.BasicAuth != nil {
 		basicAuth = cfg.BasicAuth
 	}
+	if cfg.OAuth.Enabled() {
+		oauth = cfg.OAuth
+	}
 
-	if accessToken != "" && idToken != "" {
+	switch {
+	case accessToken != "" && idToken != "":
 		clonedReq.Header.Set("X-Access-Token", accessToken)
 		clonedReq.Header.Set("X-Grafana-Id", idToken)
-	} else if apiKey != "" {
+	case oauth.Enabled():
+		// Fetch (or reuse a cached) OAuth2 access token and send it as a
+		// bearer token. This takes precedence over a static API key so that
+		// enabling OAuth is an explicit, unambiguous opt-in.
+		token, err := oauth.Token()
+		if err != nil {
+			return nil, fmt.Errorf("failed to obtain Grafana OAuth token: %w", err)
+		}
+		token.SetAuthHeader(clonedReq)
+	case apiKey != "":
 		clonedReq.Header.Set("Authorization", "Bearer "+apiKey)
-	} else if basicAuth != nil {
+	case basicAuth != nil:
 		password, _ := basicAuth.Password()
 		clonedReq.SetBasicAuth(basicAuth.Username(), password)
 	}
@@ -742,7 +766,9 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 
 	// Auth (innermost header layer — wins on conflicts with ExtraHeaders)
 	if !options.withoutAuth {
-		transport = NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
+		authRT := NewAuthRoundTripper(transport, cfg.AccessToken, cfg.IDToken, cfg.APIKey, cfg.BasicAuth)
+		authRT.oauth = cfg.OAuth
+		transport = authRT
 	}
 
 	// Extra headers (always included so per-request context overrides work)
@@ -824,13 +850,18 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 	}
 
 	extraHeaders := extraHeadersFromEnv(logger)
+	oauth := oauthConfigFromEnv(logger)
+	if oauth.Enabled() && apiKey != "" {
+		logger.Warn("Both OAuth and a service account token are configured; OAuth takes precedence and the service account token will be ignored.")
+	}
 
-	logger.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "org_id", orgID, "extra_headers_count", len(extraHeaders))
+	logger.Info("Using Grafana configuration", "url", parsedURL.Redacted(), "api_key_set", apiKey != "", "basic_auth_set", basicAuth != nil, "oauth_set", oauth.Enabled(), "org_id", orgID, "extra_headers_count", len(extraHeaders))
 	config.URL = u
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.ExtraHeaders = extraHeaders
+	config.OAuth = oauth
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -855,6 +886,9 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
+	// OAuth is configured process-wide via GRAFANA_OAUTH_* env vars (not per
+	// request), so it applies as a fallback the same way in header mode.
+	config.OAuth = oauthConfigFromEnv(logger)
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -1201,12 +1235,15 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 						}
 					}
 					// Use BuildTransport but skip APIKey/BasicAuth auth
-					// (handled by the OpenAPI client). OBO tokens still need
-					// transport-level injection since the OpenAPI client
-					// doesn't support them natively.
+					// (handled by the OpenAPI client). OBO tokens and OAuth
+					// bearer tokens still need transport-level injection since
+					// the OpenAPI client doesn't support them natively: OAuth
+					// tokens are short-lived and refreshed per request, so they
+					// can't be set as the client's static APIKey.
 					oboConfig := GrafanaConfig{
 						AccessToken:  config.AccessToken,
 						IDToken:      config.IDToken,
+						OAuth:        config.OAuth,
 						OrgID:        config.OrgID,
 						TLSConfig:    config.TLSConfig,
 						ExtraHeaders: config.ExtraHeaders,
@@ -1235,6 +1272,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 		BasicAuth:    auth,
 		AccessToken:  config.AccessToken,
 		IDToken:      config.IDToken,
+		OAuth:        config.OAuth,
 		TLSConfig:    config.TLSConfig,
 		ExtraHeaders: config.ExtraHeaders,
 		Logger:       config.Logger,

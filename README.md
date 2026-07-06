@@ -524,6 +524,49 @@ volumes:
 
 Surrounding whitespace (including a trailing newline) is trimmed from the file contents. If both `GRAFANA_SERVICE_ACCOUNT_TOKEN` and `GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE` are set, the inline token takes precedence.
 
+### OAuth2 (Client Credentials)
+
+Instead of a static service account token, the server can authenticate to Grafana with an OAuth2 [client-credentials](https://oauth.net/2/grant-types/client-credentials/) grant. This is useful when your Grafana sits behind an identity provider (Auth0, Keycloak, Okta, Azure AD, an OIDC-enabled reverse proxy, etc.) and you'd rather issue short-lived, automatically-rotated tokens than manage a long-lived token.
+
+When configured, the server exchanges the client ID/secret for an access token at the token endpoint and sends it as `Authorization: Bearer <token>` on every Grafana API request. Tokens are cached in memory and refreshed automatically shortly before they expire.
+
+Set the following environment variables to enable it:
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `GRAFANA_OAUTH_CLIENT_ID` | yes | OAuth2 client ID. |
+| `GRAFANA_OAUTH_CLIENT_SECRET` | yes | OAuth2 client secret. |
+| `GRAFANA_OAUTH_TOKEN_URL` | yes | Token endpoint that issues access tokens. |
+| `GRAFANA_OAUTH_SCOPES` | no | Space- or comma-separated list of scopes to request. |
+| `GRAFANA_OAUTH_AUDIENCE` | no | `audience` parameter sent to the token endpoint (required by some providers, e.g. Auth0). |
+
+**Example:**
+
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "mcp-grafana",
+      "args": [],
+      "env": {
+        "GRAFANA_URL": "https://myinstance.grafana.net",
+        "GRAFANA_OAUTH_CLIENT_ID": "<your client id>",
+        "GRAFANA_OAUTH_CLIENT_SECRET": "<your client secret>",
+        "GRAFANA_OAUTH_TOKEN_URL": "https://auth.example.com/oauth/token",
+        "GRAFANA_OAUTH_SCOPES": "metrics:read dashboards:read"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- All three of `GRAFANA_OAUTH_CLIENT_ID`, `GRAFANA_OAUTH_CLIENT_SECRET` and `GRAFANA_OAUTH_TOKEN_URL` must be set; an incomplete configuration is logged and ignored.
+- OAuth takes precedence over a static `GRAFANA_SERVICE_ACCOUNT_TOKEN` if both are set (a warning is logged). It does **not** apply to on-behalf-of Grafana Cloud auth (`X-Access-Token`/`X-Grafana-Id`), which still wins when present.
+- The token exchange uses its own HTTP client and is independent of the Grafana `-tls-*` settings, since the OAuth provider is typically a different host.
+- OAuth currently authenticates the core Grafana API and datasource-proxy tools. The Incident/IRM and OnCall clients still use the static service account token, so keep one configured if you rely on those tools.
+
 ### Multi-Organization Support
  
 You can specify which organization to interact with using either:
