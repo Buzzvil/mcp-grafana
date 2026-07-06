@@ -524,9 +524,12 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 		cf := mcpgrafana.ComposedStdioContextFunc(gc)
 		srv.SetContextFunc(cf)
 
-		// For stdio (single-tenant), initialize proxied tools on the server directly
+		// For stdio (single-tenant), initialize proxied tools on the server directly.
+		// This discovery makes authenticated Grafana calls; mark the context so it
+		// never triggers an interactive OAuth browser login at startup. When OAuth
+		// is in use the login instead happens lazily on the first real tool request.
 		if !dt.proxied {
-			stdioCtx := cf(ctx)
+			stdioCtx := mcpgrafana.WithoutInteractiveOAuth(cf(ctx))
 			if err := tm.InitializeAndRegisterServerTools(stdioCtx); err != nil {
 				slog.Error("failed to initialize proxied tools for stdio", "error", err)
 			}
