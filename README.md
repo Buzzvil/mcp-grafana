@@ -524,6 +524,56 @@ volumes:
 
 Surrounding whitespace (including a trailing newline) is trimmed from the file contents. If both `GRAFANA_SERVICE_ACCOUNT_TOKEN` and `GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE` are set, the inline token takes precedence.
 
+### OAuth2 login (Device Authorization Grant)
+
+Instead of storing a long-lived service account token on your machine, the server can log you in through your identity provider (Authentik, Keycloak, Okta, Auth0, Azure AD, an OIDC-enabled reverse proxy, etc.) using the OAuth2 [Device Authorization Grant](https://oauth.net/2/device-flow/) (RFC 8628). This keeps only **short-lived, per-user, revocable** tokens on the machine running the server — no static shared secret.
+
+The device flow has no browser redirect or loopback callback, so it works even when the server runs somewhere without a browser: a container, a remote host, or over SSH. On the first Grafana request the server surfaces a verification URL and a short user code — the tool call returns an error like `sign in to Grafana — open <url> ... (user code ABCD-1234), then retry your request`. Open that URL in any browser, approve, and retry: the server polls the token endpoint in the background and, once approved, sends the access token to Grafana as `Authorization: Bearer <token>`.
+
+The access token — and a refresh token when the provider issues one — are cached under your user config dir (`~/.config/mcp-grafana/` on Linux, `~/Library/Application Support/mcp-grafana/` on macOS) with `0600` permissions. Expired access tokens are refreshed automatically; the device login is only requested again when there is no valid or refreshable token.
+
+This is a **public client** flow: no client secret is required (`GRAFANA_OAUTH_CLIENT_SECRET` is optional and only used for confidential clients).
+
+Set the following environment variables to enable it:
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `GRAFANA_OAUTH_CLIENT_ID` | yes | OAuth2 public client ID. |
+| `GRAFANA_OAUTH_DEVICE_AUTH_URL` | yes | Device authorization endpoint (RFC 8628). |
+| `GRAFANA_OAUTH_TOKEN_URL` | yes | Token endpoint. |
+| `GRAFANA_OAUTH_CLIENT_SECRET` | no | Only for confidential clients; omit for a public client. |
+| `GRAFANA_OAUTH_SCOPES` | no | Space- or comma-separated scopes. Default `openid profile email offline_access` (`offline_access` requests a refresh token). |
+| `GRAFANA_OAUTH_AUDIENCE` | no | `audience` parameter sent to the device endpoint (required by some providers, e.g. Auth0). |
+| `GRAFANA_OAUTH_TOKEN_CACHE` | no | Override the on-disk token cache path. |
+| `GRAFANA_OAUTH_AUTH_TIMEOUT` | no | How long a pending device login may wait for approval (Go duration, default `10m`). |
+
+**Example:**
+
+```json
+{
+  "mcpServers": {
+    "grafana": {
+      "command": "mcp-grafana",
+      "args": [],
+      "env": {
+        "GRAFANA_URL": "https://grafana.example.com",
+        "GRAFANA_OAUTH_CLIENT_ID": "<your public client id>",
+        "GRAFANA_OAUTH_DEVICE_AUTH_URL": "https://auth.example.com/application/o/device/",
+        "GRAFANA_OAUTH_TOKEN_URL": "https://auth.example.com/application/o/token/"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- `GRAFANA_OAUTH_CLIENT_ID`, `GRAFANA_OAUTH_DEVICE_AUTH_URL` and `GRAFANA_OAUTH_TOKEN_URL` are all required; an incomplete configuration is logged and ignored.
+- The provider must have the device authorization (device code) grant enabled for this client.
+- OAuth takes precedence over a static `GRAFANA_SERVICE_ACCOUNT_TOKEN` if both are set (a warning is logged). It does **not** override on-behalf-of Grafana Cloud auth (`X-Access-Token`/`X-Grafana-Id`), which still wins when present.
+- `GRAFANA_URL` may point either directly at a Grafana that accepts the provider's tokens (`[auth.jwt]` / `[auth.generic_oauth]`) or at a reverse proxy in front of Grafana that validates the bearer token (e.g. oauth2-proxy with `--skip-jwt-bearer-tokens`).
+- OAuth currently authenticates the core Grafana API and datasource-proxy tools. The Incident/IRM and OnCall clients still use the static service account token, so keep one configured if you rely on those tools.
+
 ### Multi-Organization Support
  
 You can specify which organization to interact with using either:
