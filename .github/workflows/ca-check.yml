@@ -17,9 +17,9 @@ permissions:
 
 jobs:
   ca-check:
-    # Public fork contributions must never run on the internal runner.
+    # Validate the Buzzvil branch on a disposable GitHub-hosted runner.
     if: github.repository == 'Buzzvil/mcp-grafana' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - run: test "$(uname -m)" = x86_64
