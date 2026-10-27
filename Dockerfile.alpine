@@ -1,5 +1,9 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine3.23 AS builder
+
+# Refresh both the Go module download and final runtime trust stores.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache "ca-certificates>=20261020-r0"
 
 # Set the working directory
 WORKDIR /app
@@ -26,7 +30,8 @@ LABEL io.modelcontextprotocol.server.name="io.github.grafana/mcp-grafana"
 
 # Install ca-certificates for HTTPS requests and upgrade existing packages
 # to pick up security fixes newer than the base image snapshot
-RUN apk upgrade --no-cache && apk add --no-cache ca-certificates
+RUN apk upgrade --no-cache \
+    && apk add --no-cache "ca-certificates>=20261020-r0"
 
 # Create a non-root user
 RUN adduser -D -u 1000 mcp-grafana
