@@ -1,5 +1,11 @@
 # Build stage
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm AS builder
+
+# Refresh and verify the build-time trust store before downloading Go modules.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory
 WORKDIR /app
@@ -26,7 +32,11 @@ LABEL io.modelcontextprotocol.server.name="io.github.grafana/mcp-grafana"
 
 # Install ca-certificates for HTTPS requests and upgrade existing packages
 # to pick up security fixes (e.g. OpenSSL) newer than the base image snapshot
-RUN apt-get update && apt-get upgrade -y && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
 RUN useradd -r -u 1000 -m mcp-grafana

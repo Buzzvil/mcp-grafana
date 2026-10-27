@@ -1,0 +1,63 @@
+name: CA patch verification
+
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile*'
+      - 'go.mod'
+      - 'go.sum'
+      - 'mcpgrafana.go'
+      - 'tools/ca-check/**'
+      - 'tests/pyproject.toml'
+      - 'tests/uv.lock'
+      - '.github/workflows/ca-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ca-check:
+    # Public fork contributions must never run on the internal runner.
+    if: github.repository == 'Buzzvil/mcp-grafana' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: self-hosted
+    timeout-minutes: 25
+    steps:
+      - run: test "$(uname -m)" = x86_64
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          version: '0.13.4'
+      - name: Verify lock without installing LLM E2E dependencies
+        run: |
+          uv lock --check --project tests
+          uv venv /tmp/mcp-ca-python
+          uv pip install --python /tmp/mcp-ca-python/bin/python 'certifi==2026.10.23'
+      - name: Unit tests and certificate checker
+        run: |
+          go test -mod=readonly -tags unit ./...
+          CGO_ENABLED=0 go build -mod=readonly -o /tmp/mcp-ca-check ./tools/ca-check
+          /tmp/mcp-ca-check -ca-file "$(/tmp/mcp-ca-python/bin/python -m certifi)"
+      - name: Fresh Debian and Alpine images (local only; no registry push)
+        run: |
+          for variant in debian alpine; do
+            file=Dockerfile
+            [ "$variant" != alpine ] || file=Dockerfile.alpine
+            image="mcp-ca-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${variant}"
+            docker build --pull --no-cache --progress=plain -f "$file" -t "$image" .
+            docker run --rm --entrypoint /app/mcp-grafana "$image" --help
+            docker run --rm --entrypoint sh "$image" -c \
+              'cat /etc/os-release; if command -v dpkg-query >/dev/null; then dpkg-query -W ca-certificates; else apk info -v ca-certificates; fi'
+            container=$(docker create --entrypoint /ca-check "$image")
+            docker cp /tmp/mcp-ca-check "$container":/ca-check
+            # docker start -a does not reliably propagate the process exit code.
+            docker start -a "$container"
+            test "$(docker inspect --format '{{.State.ExitCode}}' "$container")" = 0
+            docker rm "$container"
+            docker image inspect --format '{{.Id}}' "$image"
+            docker image rm "$image"
+          done
