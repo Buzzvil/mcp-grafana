@@ -31,7 +31,7 @@ func main() {
 	check := func(host string, reject bool) {
 		resp, err := client.Head("https://" + host + "/")
 		if resp != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		if reject {
 			// DNS, timeouts, expiry and hostname failures are not distrust evidence.
