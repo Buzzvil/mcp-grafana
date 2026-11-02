@@ -17,8 +17,8 @@ permissions:
 
 jobs:
   ca-check:
-    # Validate the Buzzvil branch on a disposable GitHub-hosted runner.
-    if: github.repository == 'Buzzvil/mcp-grafana' && github.event.pull_request.head.repo.full_name == github.repository
+    # Validate PR branches, including forks, on a disposable GitHub-hosted runner.
+    if: github.repository == 'Buzzvil/mcp-grafana'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
