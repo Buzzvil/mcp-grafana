@@ -14,6 +14,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"path"
 	"reflect"
 	"runtime/debug"
 	"strconv"
@@ -611,6 +612,28 @@ func NewAuthRoundTripper(rt http.RoundTripper, accessToken, idToken, apiKey stri
 	}
 }
 
+// grafanaDestinationRoundTripper stops redirects from carrying Grafana
+// credentials (including headers supplied by the OpenAPI client) to another
+// origin or outside a configured Grafana base path.
+type grafanaDestinationRoundTripper struct {
+	base       *url.URL
+	underlying http.RoundTripper
+}
+
+func (rt *grafanaDestinationRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL == nil || !sameGrafanaOrigin(rt.base, req.URL) {
+		return nil, fmt.Errorf("Grafana request destination differs from configured origin")
+	}
+	basePath := strings.TrimRight(rt.base.Path, "/")
+	if basePath != "" && basePath != "/" {
+		requestPath := path.Clean(req.URL.Path)
+		if requestPath != basePath && !strings.HasPrefix(requestPath, basePath+"/") {
+			return nil, fmt.Errorf("Grafana request destination is outside configured base path")
+		}
+	}
+	return rt.underlying.RoundTrip(req)
+}
+
 // sensitiveHeaders lists HTTP header names whose values must be redacted in
 // debug logs to prevent credential leakage (see #919).
 var sensitiveHeaders = map[string]bool{
@@ -730,6 +753,13 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 			return nil, fmt.Errorf("failed to create TLS transport: %w", err)
 		}
 	}
+	if cfg.URL != "" {
+		if err := ValidateGrafanaURL(cfg.URL); err != nil {
+			return nil, err
+		}
+		parsed, _ := url.Parse(cfg.URL)
+		transport = &grafanaDestinationRoundTripper{base: parsed, underlying: transport}
+	}
 
 	// Debug logging with redacted credentials (innermost among the
 	// non-TLS layers so it sees the final request with all headers).
@@ -777,27 +807,21 @@ func extractKeyGrafanaInfoFromEnv(logger *slog.Logger) (url, apiKey string, auth
 	return
 }
 
-// Tries to get grafana info from a request.
-// Gets info from environment if it can't get it from request
+// Reads request Grafana settings. Server credentials are used only when the
+// request targets the server's configured Grafana endpoint.
 func extractKeyGrafanaInfoFromReq(req *http.Request, logger *slog.Logger) (grafanaUrl, apiKey string, auth *url.Userinfo, orgId int64) {
 	eUrl, eApiKey, eAuth, eOrgId := extractKeyGrafanaInfoFromEnv(logger)
 	username, password, _ := req.BasicAuth()
 
 	grafanaUrl, apiKey = urlAndAPIKeyFromHeaders(req)
-	// If anything is missing, check if we can get it from the environment
 	if grafanaUrl == "" {
 		grafanaUrl = eUrl
 	}
-
-	if apiKey == "" {
-		apiKey = eApiKey
-	}
-
-	// Use environment configured auth if nothing was passed in request
-	if username == "" && password == "" {
-		auth = eAuth
-	} else {
+	if username != "" || password != "" {
 		auth = url.UserPassword(username, password)
+	} else if apiKey == "" && sameGrafanaBaseURL(grafanaUrl, eUrl) {
+		// Server credentials belong only to the configured Grafana endpoint.
+		apiKey, auth = eApiKey, eAuth
 	}
 
 	// extract org ID from header, fall back to environment
@@ -840,8 +864,10 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 type httpContextFunc func(ctx context.Context, req *http.Request) context.Context
 
 // ExtractGrafanaInfoFromHeaders is a HTTPContextFunc that extracts Grafana configuration from HTTP request headers.
-// It reads X-Grafana-URL and X-Grafana-API-Key headers, falling back to environment variables if headers are not present.
-// Headers listed in GRAFANA_FORWARD_HEADERS are copied from the incoming request and merged with GRAFANA_EXTRA_HEADERS.
+// It reads X-Grafana-URL and X-Grafana-API-Key headers, falling back to server
+// credentials only for the configured Grafana endpoint.
+// Headers listed in GRAFANA_FORWARD_HEADERS are copied from the incoming
+// request; GRAFANA_EXTRA_HEADERS applies only to the configured endpoint.
 var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, req *http.Request) context.Context {
 	// Get existing config or create a new one.
 	// This will respect the existing debug flag, if set.
@@ -854,7 +880,15 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
-	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
+	configuredURL := strings.TrimRight(os.Getenv(grafanaURLEnvVar), "/")
+	if configuredURL == "" {
+		configuredURL = defaultGrafanaURL
+	}
+	if sameGrafanaBaseURL(u, configuredURL) {
+		config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
+	} else {
+		config.ExtraHeaders = forwardedHeadersFromRequest(req)
+	}
 	return WithGrafanaConfig(ctx, config)
 }
 
@@ -1205,6 +1239,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 					// transport-level injection since the OpenAPI client
 					// doesn't support them natively.
 					oboConfig := GrafanaConfig{
+						URL:          grafanaURL,
 						AccessToken:  config.AccessToken,
 						IDToken:      config.IDToken,
 						OrgID:        config.OrgID,

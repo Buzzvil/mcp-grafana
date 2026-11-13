@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
 	"strings"
 )
 
@@ -17,6 +19,65 @@ import (
 // /api/frontend/settings appUrl response), distinguishing that case from
 // missing-URL cases for callers that discriminate via errors.Is.
 var ErrInvalidGrafanaURL = errors.New("invalid Grafana URL")
+
+// sameGrafanaBaseURL compares the complete configured endpoint, including its
+// base path. A token configured for one Grafana must not follow a request URL
+// to another endpoint on the same host.
+func sameGrafanaBaseURL(a, b string) bool {
+	ua, errA := url.Parse(strings.TrimRight(a, "/"))
+	ub, errB := url.Parse(strings.TrimRight(b, "/"))
+	return errA == nil && errB == nil && ua.Host != "" && ub.Host != "" &&
+		sameGrafanaOrigin(ua, ub) && path.Clean(ua.Path) == path.Clean(ub.Path) &&
+		ua.RawQuery == "" && ub.RawQuery == "" && ua.Fragment == "" && ub.Fragment == ""
+}
+
+func sameGrafanaOrigin(a, b *url.URL) bool {
+	port := func(u *url.URL) string {
+		if u.Port() != "" {
+			return u.Port()
+		}
+		if u.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	return a.User == nil && b.User == nil && a.Scheme == b.Scheme &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) && port(a) == port(b)
+}
+
+// AllowGrafanaURLMiddleware limits request-selected Grafana endpoints to the
+// server's configured URL and the exact URLs in GRAFANA_ALLOWED_URLS. This is
+// the outbound destination policy for the HTTP/SSE entrypoints.
+func AllowGrafanaURLMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := r.Header.Get(grafanaURLHeader)
+		if raw != "" {
+			configured := strings.TrimRight(os.Getenv(grafanaURLEnvVar), "/")
+			if configured == "" {
+				configured = defaultGrafanaURL
+			}
+			configuredTarget := sameGrafanaBaseURL(raw, configured)
+			allowed := configuredTarget
+			for _, candidate := range strings.Split(os.Getenv("GRAFANA_ALLOWED_URLS"), ",") {
+				if sameGrafanaBaseURL(raw, strings.TrimSpace(candidate)) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				http.Error(w, "X-Grafana-URL is not an allowed Grafana endpoint", http.StatusBadRequest)
+				return
+			}
+			_, _, basicAuth := r.BasicAuth()
+			if !configuredTarget && r.Header.Get(grafanaServiceAccountTokenHeader) == "" &&
+				r.Header.Get(grafanaAPIKeyHeader) == "" && !basicAuth {
+				http.Error(w, "X-Grafana-URL needs request credentials for this endpoint", http.StatusBadRequest)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // ValidateGrafanaURL returns nil if u is an absolute HTTP or HTTPS URL with a
 // non-empty host. Trailing slashes are trimmed before validation so callers do

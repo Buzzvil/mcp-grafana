@@ -188,6 +188,36 @@ func TestValidateGrafanaURLMiddleware(t *testing.T) {
 	})
 }
 
+func TestAllowGrafanaURLMiddleware(t *testing.T) {
+	t.Setenv(grafanaURLEnvVar, "https://trusted.example/grafana")
+	t.Setenv("GRAFANA_ALLOWED_URLS", "https://second.example/grafana")
+	handler := ValidateGrafanaURLMiddleware(AllowGrafanaURLMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})))
+	for _, tc := range []struct {
+		url   string
+		token bool
+		want  int
+	}{
+		{"https://trusted.example/grafana/", false, http.StatusNoContent},
+		{"https://second.example/grafana", true, http.StatusNoContent},
+		{"https://second.example/grafana", false, http.StatusBadRequest},
+		{"https://other.example/grafana", true, http.StatusBadRequest},
+		{"https://trusted.example/other-path", true, http.StatusBadRequest},
+		{"http://trusted.example/grafana", true, http.StatusBadRequest},
+		{"https://trusted.example.evil.invalid/grafana", true, http.StatusBadRequest},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set(grafanaURLHeader, tc.url)
+		if tc.token {
+			req.Header.Set(grafanaServiceAccountTokenHeader, "request-token")
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, tc.want, rec.Code, tc.url)
+	}
+}
+
 // Smoke coverage for ExtractGrafanaClientFromHeaders client construction.
 // These two tests exercise the extractor end-to-end (header parsing -> client
 // wiring -> real HTTP call against a test server) without depending on

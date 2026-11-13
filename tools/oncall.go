@@ -92,12 +92,15 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 			}
 			if httpClientField.IsValid() && httpClientField.CanSet() {
 				if httpClient, ok := httpClientField.Interface().(*http.Client); ok {
-					transport, err := mcpgrafana.BuildTransport(&cfg, nil, mcpgrafana.WithoutAuth())
+					// The OnCall API is hosted at the URL reported by Grafana's
+					// settings, so bind this client's transport to that origin.
+					oncallCfg := cfg
+					oncallCfg.URL = grafanaOnCallURL
+					transport, err := mcpgrafana.BuildTransport(&oncallCfg, nil, mcpgrafana.WithoutAuth())
 					if err != nil {
-						mcpgrafana.LoggerFromContext(ctx).Error("Failed to build transport for OnCall client", "error", err)
-					} else {
-						httpClient.Transport = transport
+						return nil, fmt.Errorf("failed to build transport for OnCall client: %w", err)
 					}
+					httpClient.Transport = transport
 				}
 			}
 		}

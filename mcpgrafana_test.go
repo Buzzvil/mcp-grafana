@@ -280,6 +280,77 @@ func TestExtractGrafanaInfoFromHeaders(t *testing.T) {
 	})
 }
 
+func TestRequestGrafanaURLDoesNotInheritServerCredentials(t *testing.T) {
+	t.Setenv(grafanaURLEnvVar, "https://trusted.example/grafana")
+	t.Setenv(grafanaServiceAccountTokenEnvVar, "server-token")
+	t.Setenv(grafanaUsernameEnvVar, "server-user")
+	t.Setenv(grafanaPasswordEnvVar, "server-password")
+	t.Setenv(grafanaExtraHeadersEnvVar, `{"Authorization":"Bearer extra-server-token"}`)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(grafanaURLHeader, "https://other.example/grafana")
+	cfg := GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(context.Background(), req))
+	assert.Empty(t, cfg.APIKey)
+	assert.Nil(t, cfg.BasicAuth)
+	assert.Empty(t, cfg.ExtraHeaders)
+
+	req.Header.Set(grafanaURLHeader, "https://trusted.example/other-path")
+	cfg = GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(context.Background(), req))
+	assert.Empty(t, cfg.APIKey)
+	assert.Nil(t, cfg.BasicAuth)
+
+	req.Header.Set(grafanaURLHeader, "https://trusted.example/grafana/")
+	cfg = GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(context.Background(), req))
+	assert.Equal(t, "server-token", cfg.APIKey)
+	assert.NotNil(t, cfg.BasicAuth)
+	assert.Equal(t, "Bearer extra-server-token", cfg.ExtraHeaders["Authorization"])
+
+	req.Header.Set(grafanaURLHeader, "https://other.example/grafana")
+	req.Header.Set(grafanaServiceAccountTokenHeader, "request-token")
+	cfg = GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(context.Background(), req))
+	assert.Equal(t, "request-token", cfg.APIKey)
+	assert.Nil(t, cfg.BasicAuth)
+}
+
+func TestBuildTransportRejectsCrossOriginRedirect(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	trusted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer server-token", r.Header.Get("Authorization"))
+		http.Redirect(w, r, target.URL+"/api/frontend/settings", http.StatusFound)
+	}))
+	defer trusted.Close()
+
+	transport, err := BuildTransport(&GrafanaConfig{URL: trusted.URL, APIKey: "server-token"}, nil, WithoutOtel())
+	require.NoError(t, err)
+	_, err = (&http.Client{Transport: transport}).Get(trusted.URL + "/api/frontend/settings")
+	require.Error(t, err)
+	assert.Zero(t, targetHits.Load())
+}
+
+func TestBuildTransportRejectsRedirectOutsideBasePath(t *testing.T) {
+	var outsideHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/outside" {
+			outsideHits.Add(1)
+			return
+		}
+		http.Redirect(w, r, "/outside", http.StatusFound)
+	}))
+	defer server.Close()
+
+	transport, err := BuildTransport(&GrafanaConfig{URL: server.URL + "/grafana", APIKey: "server-token"}, nil, WithoutOtel())
+	require.NoError(t, err)
+	_, err = (&http.Client{Transport: transport}).Get(server.URL + "/grafana/api/frontend/settings")
+	require.Error(t, err)
+	assert.Zero(t, outsideHits.Load())
+}
+
 func TestExtractGrafanaClientPath(t *testing.T) {
 	t.Run("no custom path", func(t *testing.T) {
 		t.Setenv("GRAFANA_URL", "http://my-test-url.grafana.com/")
