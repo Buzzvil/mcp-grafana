@@ -622,13 +622,13 @@ type grafanaDestinationRoundTripper struct {
 
 func (rt *grafanaDestinationRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL == nil || !sameGrafanaOrigin(rt.base, req.URL) {
-		return nil, fmt.Errorf("Grafana request destination differs from configured origin")
+		return nil, fmt.Errorf("grafana request destination differs from configured origin")
 	}
 	basePath := strings.TrimRight(rt.base.Path, "/")
 	if basePath != "" && basePath != "/" {
 		requestPath := path.Clean(req.URL.Path)
 		if requestPath != basePath && !strings.HasPrefix(requestPath, basePath+"/") {
-			return nil, fmt.Errorf("Grafana request destination is outside configured base path")
+			return nil, fmt.Errorf("grafana request destination is outside configured base path")
 		}
 	}
 	return rt.underlying.RoundTrip(req)
