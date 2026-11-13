@@ -312,6 +312,23 @@ func TestRequestGrafanaURLDoesNotInheritServerCredentials(t *testing.T) {
 	assert.Nil(t, cfg.BasicAuth)
 }
 
+func TestSchemelessConfiguredGrafanaKeepsServerCredentials(t *testing.T) {
+	t.Setenv(grafanaURLEnvVar, "trusted.example/grafana")
+	t.Setenv(grafanaServiceAccountTokenEnvVar, "server-token")
+	t.Setenv(grafanaExtraHeadersEnvVar, `{"X-Tenant-ID":"server-tenant"}`)
+
+	for _, headerURL := range []string{"", "https://trusted.example/grafana"} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		if headerURL != "" {
+			req.Header.Set(grafanaURLHeader, headerURL)
+		}
+		cfg := GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(context.Background(), req))
+		assert.Equal(t, "https://trusted.example/grafana", cfg.URL)
+		assert.Equal(t, "server-token", cfg.APIKey)
+		assert.Equal(t, "server-tenant", cfg.ExtraHeaders["X-Tenant-ID"])
+	}
+}
+
 func TestBuildTransportRejectsCrossOriginRedirect(t *testing.T) {
 	var targetHits atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -349,6 +366,21 @@ func TestBuildTransportRejectsRedirectOutsideBasePath(t *testing.T) {
 	_, err = (&http.Client{Transport: transport}).Get(server.URL + "/grafana/api/frontend/settings")
 	require.Error(t, err)
 	assert.Zero(t, outsideHits.Load())
+}
+
+func TestBuildTransportRejectsEncodedBasePathVariant(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	transport, err := BuildTransport(&GrafanaConfig{URL: server.URL + "/team/grafana", APIKey: "server-token"}, nil, WithoutOtel())
+	require.NoError(t, err)
+	_, err = (&http.Client{Transport: transport}).Get(server.URL + "/team%2Fgrafana/api/frontend/settings")
+	require.Error(t, err)
+	assert.Zero(t, hits.Load())
 }
 
 func TestExtractGrafanaClientPath(t *testing.T) {

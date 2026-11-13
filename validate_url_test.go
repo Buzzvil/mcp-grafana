@@ -206,6 +206,7 @@ func TestAllowGrafanaURLMiddleware(t *testing.T) {
 		{"https://trusted.example/other-path", true, http.StatusBadRequest},
 		{"http://trusted.example/grafana", true, http.StatusBadRequest},
 		{"https://trusted.example.evil.invalid/grafana", true, http.StatusBadRequest},
+		{"https://trusted.example/grafana%2F", true, http.StatusBadRequest},
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		req.Header.Set(grafanaURLHeader, tc.url)
@@ -216,6 +217,25 @@ func TestAllowGrafanaURLMiddleware(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		assert.Equal(t, tc.want, rec.Code, tc.url)
 	}
+}
+
+func TestSameGrafanaBaseURLRejectsEncodedPathVariant(t *testing.T) {
+	assert.True(t, sameGrafanaBaseURL("https://trusted.example/team/grafana/", "https://trusted.example/team/grafana"))
+	assert.False(t, sameGrafanaBaseURL("https://trusted.example/team%2Fgrafana", "https://trusted.example/team/grafana"))
+	assert.False(t, sameGrafanaBaseURL("https://trusted.example/team/../team/grafana", "https://trusted.example/team/grafana"))
+}
+
+func TestAllowGrafanaURLMiddlewareNormalizesConfiguredURL(t *testing.T) {
+	t.Setenv(grafanaURLEnvVar, "trusted.example/grafana")
+	t.Setenv("GRAFANA_ALLOWED_URLS", "")
+	handler := AllowGrafanaURLMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set(grafanaURLHeader, "https://trusted.example/grafana")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNoContent, rec.Code)
 }
 
 // Smoke coverage for ExtractGrafanaClientFromHeaders client construction.

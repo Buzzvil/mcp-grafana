@@ -624,10 +624,13 @@ func (rt *grafanaDestinationRoundTripper) RoundTrip(req *http.Request) (*http.Re
 	if req.URL == nil || !sameGrafanaOrigin(rt.base, req.URL) {
 		return nil, fmt.Errorf("grafana request destination differs from configured origin")
 	}
-	basePath := strings.TrimRight(rt.base.Path, "/")
+	basePath := strings.TrimRight(rt.base.EscapedPath(), "/")
 	if basePath != "" && basePath != "/" {
-		requestPath := path.Clean(req.URL.Path)
-		if requestPath != basePath && !strings.HasPrefix(requestPath, basePath+"/") {
+		requestPath := req.URL.EscapedPath()
+		cleanPath := path.Clean(req.URL.Path)
+		cleanBasePath := path.Clean(rt.base.Path)
+		if (requestPath != basePath && !strings.HasPrefix(requestPath, basePath+"/")) ||
+			(cleanPath != cleanBasePath && !strings.HasPrefix(cleanPath, cleanBasePath+"/")) {
 			return nil, fmt.Errorf("grafana request destination is outside configured base path")
 		}
 	}
@@ -802,6 +805,7 @@ func extractKeyGrafanaInfoFromEnv(logger *slog.Logger) (url, apiKey string, auth
 	if url == "" {
 		url = defaultGrafanaURL
 	}
+	url = normalizeGrafanaURL(url)
 	auth = userAndPassFromEnv()
 	orgId = orgIdFromEnv(logger)
 	return
@@ -880,7 +884,7 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
-	configuredURL := strings.TrimRight(os.Getenv(grafanaURLEnvVar), "/")
+	configuredURL := normalizeGrafanaURL(os.Getenv(grafanaURLEnvVar))
 	if configuredURL == "" {
 		configuredURL = defaultGrafanaURL
 	}

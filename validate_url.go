@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"strings"
 )
 
@@ -27,7 +26,7 @@ func sameGrafanaBaseURL(a, b string) bool {
 	ua, errA := url.Parse(strings.TrimRight(a, "/"))
 	ub, errB := url.Parse(strings.TrimRight(b, "/"))
 	return errA == nil && errB == nil && ua.Host != "" && ub.Host != "" &&
-		sameGrafanaOrigin(ua, ub) && path.Clean(ua.Path) == path.Clean(ub.Path) &&
+		sameGrafanaOrigin(ua, ub) && ua.EscapedPath() == ub.EscapedPath() &&
 		ua.RawQuery == "" && ub.RawQuery == "" && ua.Fragment == "" && ub.Fragment == ""
 }
 
@@ -52,7 +51,7 @@ func AllowGrafanaURLMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw := r.Header.Get(grafanaURLHeader)
 		if raw != "" {
-			configured := strings.TrimRight(os.Getenv(grafanaURLEnvVar), "/")
+			configured := normalizeGrafanaURL(os.Getenv(grafanaURLEnvVar))
 			if configured == "" {
 				configured = defaultGrafanaURL
 			}
