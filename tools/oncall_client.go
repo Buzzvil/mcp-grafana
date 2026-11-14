@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/grafana/mcp-grafana"
+	"github.com/hashicorp/go-retryablehttp"
 )
 
 // oncallClient uses the same destination-checked transport as Grafana API
@@ -20,7 +21,7 @@ type oncallClient struct {
 	baseURL    string
 	grafanaURL string
 	apiKey     string
-	httpClient *http.Client
+	httpClient *retryablehttp.Client
 	config     mcpgrafana.GrafanaConfig
 }
 
@@ -49,11 +50,18 @@ func newOncallClient(cfg mcpgrafana.GrafanaConfig, oncallURL string) (*oncallCli
 	if err != nil {
 		return nil, fmt.Errorf("building OnCall transport: %w", err)
 	}
+	baseURL := oncallURL + "/api/v1/"
+	if strings.HasSuffix(parsed.Path, "/api/v1") {
+		baseURL = oncallURL + "/"
+	}
+	retryClient := retryablehttp.NewClient()
+	retryClient.Logger = nil
+	retryClient.HTTPClient = &http.Client{Transport: transport, Timeout: cfg.Timeout}
 	return &oncallClient{
-		baseURL:    oncallURL + "/api/v1/",
+		baseURL:    baseURL,
 		grafanaURL: cfg.URL,
 		apiKey:     cfg.APIKey,
-		httpClient: &http.Client{Transport: transport, Timeout: cfg.Timeout},
+		httpClient: retryClient,
 		config:     oncallCfg,
 	}, nil
 }
@@ -72,13 +80,14 @@ func (c *oncallClient) get(ctx context.Context, resource, id string, query url.V
 	}
 	// ExtraHeadersRoundTripper also reads config from the request context.
 	// Replace it with the stripped OnCall config before sending this request.
-	req, err := http.NewRequestWithContext(mcpgrafana.WithGrafanaConfig(ctx, c.config), http.MethodGet, requestURL, nil)
+	req, err := retryablehttp.NewRequestWithContext(mcpgrafana.WithGrafanaConfig(ctx, c.config), http.MethodGet, requestURL, nil)
 	if err != nil {
 		return fmt.Errorf("creating OnCall request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", c.apiKey)
 	req.Header.Set("X-Grafana-URL", c.grafanaURL)
+	req.Header.Set("User-Agent", "amixr-api-go-client")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

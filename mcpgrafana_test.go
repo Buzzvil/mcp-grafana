@@ -383,6 +383,23 @@ func TestBuildTransportRejectsEncodedBasePathVariant(t *testing.T) {
 	assert.Zero(t, hits.Load())
 }
 
+func TestBuildTransportAcceptsCanonicalPathForEncodedBase(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		assert.Equal(t, "/grafana/api/frontend/settings", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	transport, err := BuildTransport(&GrafanaConfig{URL: server.URL + "/%67rafana", APIKey: "synthetic-token"}, nil, WithoutOtel())
+	require.NoError(t, err)
+	resp, err := (&http.Client{Transport: transport}).Get(server.URL + "/grafana/api/frontend/settings")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.EqualValues(t, 1, hits.Load())
+}
+
 func TestExtractGrafanaClientPath(t *testing.T) {
 	t.Run("no custom path", func(t *testing.T) {
 		t.Setenv("GRAFANA_URL", "http://my-test-url.grafana.com/")

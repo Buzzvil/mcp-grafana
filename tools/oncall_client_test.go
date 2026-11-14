@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	aapi "github.com/grafana/amixr-api-go-client"
 	mcpgrafana "github.com/grafana/mcp-grafana"
@@ -21,6 +22,7 @@ func TestOncallClientUsesCheckedTransport(t *testing.T) {
 		authorization string
 		grafanaURL    string
 		extraHeader   string
+		userAgent     string
 	}
 	received := make(chan receivedRequest, 1)
 	oncall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,6 +31,7 @@ func TestOncallClientUsesCheckedTransport(t *testing.T) {
 			authorization: r.Header.Get("Authorization"),
 			grafanaURL:    r.Header.Get("X-Grafana-URL"),
 			extraHeader:   r.Header.Get("X-Private"),
+			userAgent:     r.Header.Get("User-Agent"),
 		}
 		_ = json.NewEncoder(w).Encode(aapi.PaginatedUsersResponse{
 			Users: []*aapi.User{{ID: "u1"}},
@@ -53,6 +56,43 @@ func TestOncallClientUsesCheckedTransport(t *testing.T) {
 	require.Equal(t, apiKey, got.authorization)
 	require.Equal(t, cfg.URL, got.grafanaURL)
 	require.Empty(t, got.extraHeader)
+	require.Equal(t, "amixr-api-go-client", got.userAgent)
+}
+
+func TestOncallClientDoesNotRepeatAPIVersion(t *testing.T) {
+	oncall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/oncall/api/v1/users/", r.URL.Path)
+		_ = json.NewEncoder(w).Encode(aapi.PaginatedUsersResponse{})
+	}))
+	defer oncall.Close()
+
+	cfg := mcpgrafana.GrafanaConfig{URL: "https://grafana.example", APIKey: "synthetic-oncall-key"}
+	client, err := newOncallClient(cfg, oncall.URL+"/oncall/api/v1/")
+	require.NoError(t, err)
+	var result aapi.PaginatedUsersResponse
+	require.NoError(t, client.get(context.Background(), "users", "", nil, &result))
+}
+
+func TestOncallClientRetriesRateLimit(t *testing.T) {
+	var attempts atomic.Int32
+	oncall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "synthetic-oncall-key", r.Header.Get("Authorization"))
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(aapi.PaginatedUsersResponse{})
+	}))
+	defer oncall.Close()
+
+	cfg := mcpgrafana.GrafanaConfig{URL: "https://grafana.example", APIKey: "synthetic-oncall-key"}
+	client, err := newOncallClient(cfg, oncall.URL+"/oncall")
+	require.NoError(t, err)
+	client.httpClient.RetryWaitMin = time.Millisecond
+	client.httpClient.RetryWaitMax = time.Millisecond
+	var result aapi.PaginatedUsersResponse
+	require.NoError(t, client.get(context.Background(), "users", "", nil, &result))
+	require.EqualValues(t, 2, attempts.Load())
 }
 
 func TestOncallClientRejectsRedirectsWithCredentials(t *testing.T) {
@@ -81,6 +121,8 @@ func TestOncallClientRejectsRedirectsWithCredentials(t *testing.T) {
 	cfg := mcpgrafana.GrafanaConfig{URL: "https://grafana.example", APIKey: "synthetic-oncall-key"}
 	client, err := newOncallClient(cfg, oncall.URL+"/oncall")
 	require.NoError(t, err)
+	client.httpClient.RetryWaitMin = time.Millisecond
+	client.httpClient.RetryWaitMax = time.Millisecond
 	var result aapi.PaginatedUsersResponse
 	require.Error(t, client.get(context.Background(), "users", "", nil, &result))
 	require.EqualValues(t, 0, externalRequests.Load())

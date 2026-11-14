@@ -627,10 +627,17 @@ func (rt *grafanaDestinationRoundTripper) RoundTrip(req *http.Request) (*http.Re
 	basePath := strings.TrimRight(rt.base.EscapedPath(), "/")
 	if basePath != "" && basePath != "/" {
 		requestPath := req.URL.EscapedPath()
+		// The OpenAPI client constructs requests from the decoded base Path.
+		// Accept that canonical form as well as the configured escaped form,
+		// while still rejecting other escaped aliases and decoded traversal.
+		canonicalBasePath := strings.TrimRight((&url.URL{Path: rt.base.Path}).EscapedPath(), "/")
+		withinBasePath := func(candidate, base string) bool {
+			return candidate == base || strings.HasPrefix(candidate, base+"/")
+		}
 		cleanPath := path.Clean(req.URL.Path)
 		cleanBasePath := path.Clean(rt.base.Path)
-		if (requestPath != basePath && !strings.HasPrefix(requestPath, basePath+"/")) ||
-			(cleanPath != cleanBasePath && !strings.HasPrefix(cleanPath, cleanBasePath+"/")) {
+		if (!withinBasePath(requestPath, basePath) && !withinBasePath(requestPath, canonicalBasePath)) ||
+			!withinBasePath(cleanPath, cleanBasePath) {
 			return nil, fmt.Errorf("grafana request destination is outside configured base path")
 		}
 	}
