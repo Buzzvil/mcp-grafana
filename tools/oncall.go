@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"reflect"
-	"strings"
 
 	aapi "github.com/grafana/amixr-api-go-client"
 	mcpgrafana "github.com/grafana/mcp-grafana"
@@ -59,9 +57,9 @@ func getOnCallURLFromSettings(ctx context.Context, cfg mcpgrafana.GrafanaConfig)
 	return settings.JSONData.OnCallAPIURL, nil
 }
 
-// oncallClientFromContext creates an amixr client for the public OnCall API.
+// oncallClientFromContext creates a destination-checked client for the public OnCall API.
 // Used as fallback when OBO auth is not available (OSS / self-hosted with API key).
-func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
+func oncallClientFromContext(ctx context.Context) (*oncallClient, error) {
 	cfg := mcpgrafana.GrafanaConfigFromContext(ctx)
 
 	grafanaOnCallURL, err := getOnCallURLFromSettings(ctx, cfg)
@@ -69,41 +67,7 @@ func oncallClientFromContext(ctx context.Context) (*aapi.Client, error) {
 		return nil, fmt.Errorf("getting OnCall URL from settings: %w", err)
 	}
 
-	grafanaOnCallURL = strings.TrimRight(grafanaOnCallURL, "/")
-
-	client, err := aapi.NewWithGrafanaURL(grafanaOnCallURL, cfg.APIKey, cfg.URL)
-	if err != nil {
-		return nil, fmt.Errorf("creating OnCall client: %w", err)
-	}
-
-	// Customize the HTTP client's transport using reflection since the
-	// OnCall client doesn't expose its HTTP client directly. Auth is
-	// handled by the OnCall library (API key passed above), so we skip it.
-	clientValue := reflect.ValueOf(client)
-	if clientValue.Kind() == reflect.Ptr && !clientValue.IsNil() {
-		clientValue = clientValue.Elem()
-		if clientValue.Kind() == reflect.Struct {
-			httpClientField := clientValue.FieldByName("HTTPClient")
-			if !httpClientField.IsValid() {
-				httpClientField = clientValue.FieldByName("HttpClient")
-			}
-			if !httpClientField.IsValid() {
-				httpClientField = clientValue.FieldByName("Client")
-			}
-			if httpClientField.IsValid() && httpClientField.CanSet() {
-				if httpClient, ok := httpClientField.Interface().(*http.Client); ok {
-					transport, err := mcpgrafana.BuildTransport(&cfg, nil, mcpgrafana.WithoutAuth())
-					if err != nil {
-						mcpgrafana.LoggerFromContext(ctx).Error("Failed to build transport for OnCall client", "error", err)
-					} else {
-						httpClient.Transport = transport
-					}
-				}
-			}
-		}
-	}
-
-	return client, nil
+	return newOncallClient(cfg, grafanaOnCallURL)
 }
 
 // --- Schedules ---
@@ -136,11 +100,9 @@ func amixrListSchedules(ctx context.Context, args ListOnCallSchedulesParams) ([]
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	scheduleService := aapi.NewScheduleService(client)
-
 	if args.ScheduleID != "" {
-		schedule, _, err := scheduleService.GetSchedule(args.ScheduleID, &aapi.GetScheduleOptions{})
-		if err != nil {
+		var schedule aapi.Schedule
+		if err := client.get(ctx, "schedules", args.ScheduleID, nil, &schedule); err != nil {
 			return nil, fmt.Errorf("getting OnCall schedule %s: %w", args.ScheduleID, err)
 		}
 		summary := &ScheduleSummary{
@@ -155,16 +117,12 @@ func amixrListSchedules(ctx context.Context, args ListOnCallSchedulesParams) ([]
 		return []*ScheduleSummary{summary}, nil
 	}
 
-	listOptions := &aapi.ListScheduleOptions{}
-	if args.Page > 0 {
-		listOptions.Page = args.Page
-	}
+	query := oncallListQuery(args.Page)
 	if args.TeamID != "" {
-		listOptions.TeamID = args.TeamID
+		query.Set("team_id", args.TeamID)
 	}
-
-	response, _, err := scheduleService.ListSchedules(listOptions)
-	if err != nil {
+	var response aapi.PaginatedSchedulesResponse
+	if err := client.get(ctx, "schedules", "", query, &response); err != nil {
 		return nil, fmt.Errorf("listing OnCall schedules: %w", err)
 	}
 
@@ -213,9 +171,8 @@ func amixrGetShift(ctx context.Context, shiftID string) (*OnCallShift, error) {
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	shiftService := aapi.NewOnCallShiftService(client)
-	shift, _, err := shiftService.GetOnCallShift(shiftID, &aapi.GetOnCallShiftOptions{})
-	if err != nil {
+	var shift aapi.OnCallShift
+	if err := client.get(ctx, "on_call_shifts", shiftID, nil, &shift); err != nil {
 		return nil, fmt.Errorf("getting OnCall shift %s: %w", shiftID, err)
 	}
 
@@ -270,9 +227,8 @@ func amixrGetCurrentOnCallUsers(ctx context.Context, scheduleID string) (*Curren
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	scheduleService := aapi.NewScheduleService(client)
-	schedule, _, err := scheduleService.GetSchedule(scheduleID, &aapi.GetScheduleOptions{})
-	if err != nil {
+	var schedule aapi.Schedule
+	if err := client.get(ctx, "schedules", scheduleID, nil, &schedule); err != nil {
 		return nil, fmt.Errorf("getting schedule %s: %w", scheduleID, err)
 	}
 
@@ -286,10 +242,9 @@ func amixrGetCurrentOnCallUsers(ctx context.Context, scheduleID string) (*Curren
 		return result, nil
 	}
 
-	userService := aapi.NewUserService(client)
 	for _, userID := range schedule.OnCallNow {
-		user, _, err := userService.GetUser(userID, &aapi.GetUserOptions{})
-		if err != nil {
+		var user aapi.User
+		if err := client.get(ctx, "users", userID, nil, &user); err != nil {
 			continue
 		}
 		result.Users = append(result.Users, &OnCallUser{
@@ -331,14 +286,8 @@ func amixrListTeams(ctx context.Context, args ListOnCallTeamsParams) ([]*OnCallT
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	teamService := aapi.NewTeamService(client)
-	listOptions := &aapi.ListTeamOptions{}
-	if args.Page > 0 {
-		listOptions.Page = args.Page
-	}
-
-	response, _, err := teamService.ListTeams(listOptions)
-	if err != nil {
+	var response aapi.PaginatedTeamsResponse
+	if err := client.get(ctx, "teams", "", oncallListQuery(args.Page), &response); err != nil {
 		return nil, fmt.Errorf("listing OnCall teams: %w", err)
 	}
 
@@ -384,11 +333,9 @@ func amixrListUsers(ctx context.Context, args ListOnCallUsersParams) ([]*OnCallU
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	userService := aapi.NewUserService(client)
-
 	if args.UserID != "" {
-		user, _, err := userService.GetUser(args.UserID, &aapi.GetUserOptions{})
-		if err != nil {
+		var user aapi.User
+		if err := client.get(ctx, "users", args.UserID, nil, &user); err != nil {
 			return nil, fmt.Errorf("getting OnCall user %s: %w", args.UserID, err)
 		}
 		return []*OnCallUser{{
@@ -399,16 +346,12 @@ func amixrListUsers(ctx context.Context, args ListOnCallUsersParams) ([]*OnCallU
 		}}, nil
 	}
 
-	listOptions := &aapi.ListUserOptions{}
-	if args.Page > 0 {
-		listOptions.Page = args.Page
-	}
+	query := oncallListQuery(args.Page)
 	if args.Username != "" {
-		listOptions.Username = args.Username
+		query.Set("username", args.Username)
 	}
-
-	response, _, err := userService.ListUsers(listOptions)
-	if err != nil {
+	var response aapi.PaginatedUsersResponse
+	if err := client.get(ctx, "users", "", query, &response); err != nil {
 		return nil, fmt.Errorf("listing OnCall users: %w", err)
 	}
 
@@ -455,44 +398,41 @@ func listAlertGroups(ctx context.Context, args ListAlertGroupsParams) ([]*OnCall
 }
 
 func amixrListAlertGroups(ctx context.Context, args ListAlertGroupsParams) ([]*OnCallAlertGroup, error) {
+	if err := (&aapi.ListAlertGroupOptions{StartedAt: args.StartedAt}).Validate(); err != nil {
+		return nil, err
+	}
 	client, err := oncallClientFromContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	alertGroupService := aapi.NewAlertGroupService(client)
-
-	listOptions := &aapi.ListAlertGroupOptions{}
-	if args.Page > 0 {
-		listOptions.Page = args.Page
-	}
+	query := oncallListQuery(args.Page)
 	if args.AlertGroupID != "" {
-		listOptions.AlertGroupID = args.AlertGroupID
+		query.Set("id", args.AlertGroupID)
 	}
 	if args.RouteID != "" {
-		listOptions.RouteID = args.RouteID
+		query.Set("route_id", args.RouteID)
 	}
 	if args.IntegrationID != "" {
-		listOptions.IntegrationID = args.IntegrationID
+		query.Set("integration_id", args.IntegrationID)
 	}
 	if args.State != "" {
-		listOptions.State = args.State
+		query.Set("state", args.State)
 	}
 	if args.TeamID != "" {
-		listOptions.TeamID = args.TeamID
+		query.Set("team_id", args.TeamID)
 	}
 	if args.StartedAt != "" {
-		listOptions.StartedAt = args.StartedAt
+		query.Set("started_at", args.StartedAt)
 	}
-	if len(args.Labels) > 0 {
-		listOptions.Labels = args.Labels
+	for _, label := range args.Labels {
+		query.Add("label", label)
 	}
 	if args.Name != "" {
-		listOptions.Name = args.Name
+		query.Set("name", args.Name)
 	}
-
-	response, _, err := alertGroupService.ListAlertGroups(listOptions)
-	if err != nil {
+	var response aapi.PaginatedAlertGroupsResponse
+	if err := client.get(ctx, "alert_groups", "", query, &response); err != nil {
 		return nil, fmt.Errorf("listing OnCall alert groups: %w", err)
 	}
 
@@ -539,9 +479,8 @@ func amixrGetAlertGroup(ctx context.Context, alertGroupID string) (*OnCallAlertG
 		return nil, fmt.Errorf("getting OnCall client: %w", err)
 	}
 
-	alertGroupService := aapi.NewAlertGroupService(client)
-	ag, _, err := alertGroupService.GetAlertGroup(alertGroupID)
-	if err != nil {
+	var ag aapi.AlertGroup
+	if err := client.get(ctx, "alert_groups", alertGroupID, nil, &ag); err != nil {
 		return nil, fmt.Errorf("getting OnCall alert group %s: %w", alertGroupID, err)
 	}
 
